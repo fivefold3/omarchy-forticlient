@@ -1,0 +1,502 @@
+#!/bin/bash
+# FortiClient VPN backend for the Omarchy shell plugin. Every VPN action goes
+# through FortiClient's own CLI (`forticlient vpn ...`), which talks to the
+# FortiClient service; nothing here needs root.
+#
+#   forticlient-vpn status           key<TAB>value lines: installed, service, and,
+#                                    while the service runs, state/name/user/ip/sent/recv/duration.
+#                                    "busy 1" means another FortiClient command held the lock.
+#   forticlient-vpn profiles         One TSV line per profile:
+#                                    name kind gateway port auth username save-password auto-connect always-up
+#                                    kind is personal or corporate; auth is prompt, save or none.
+#   forticlient-vpn save <name> <host> <port> <prompt|save|none> [username]
+#                                    Create the profile, or edit it if it exists.
+#   forticlient-vpn remove <name>
+#   forticlient-vpn connect <name> [-u user] [-p] [-s] [-a] [-w]
+#                                    Same flags as `forticlient vpn connect`. With -p, the first line
+#                                    on stdin is the password. Reports one event per line:
+#                                      status<TAB>text   error<TAB>text   info<TAB>text   done
+#                                      prompt<TAB>secret(0|1)<TAB>prompt<TAB>context
+#                                    and reads each prompt's answer as a line on stdin.
+#   forticlient-vpn disconnect
+#   forticlient-vpn start-service    Start the FortiClient service now (polkit asks). Setup is
+#                                    what offers to start it at boot as well.
+#   forticlient-vpn setup            Guided setup in a terminal, asking first about each step.
+#   forticlient-vpn offer-setup      Run by the plugin on load: offers setup once, in a notification.
+
+set -uo pipefail
+
+PLUGIN_ID=io.github.fivefold3.forticlient
+SERVICE=forticlient.service
+OFFERED_FILE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-forticlient/setup-offered
+# FortiClient's own tray icon, started from its XDG autostart entry.
+TRAY=/opt/forticlient/fortitray
+TRAY_OVERRIDE=${XDG_CONFIG_HOME:-$HOME/.config}/autostart/Fortitray.desktop
+TRAY_UNIT=app-Fortitray@autostart.service
+
+notify() { notify-send -a "FortiClient VPN" "$@"; }
+
+LOCKED="Another instance of this program is running."
+
+installed() { command -v forticlient >/dev/null; }
+service_active() { systemctl is-active --quiet "$SERVICE"; }
+service_ready() { service_active && [[ $(systemctl is-enabled "$SERVICE" 2>/dev/null) == enabled ]]; }
+
+# The tray needs gtk2, which forticlient-vpn only lists as optional (it's in
+# the AUR). Without it the launcher restarts the tray every few seconds.
+tray_broken() {
+  [[ -x $TRAY && ! -f $TRAY_OVERRIDE ]] && ! ldconfig -p 2>/dev/null | grep -q 'libgtk-x11-2\.0\.so\.0'
+}
+
+# One CLI call, in the C locale since its text is what gets parsed.
+fc_once() { LC_ALL=C timeout "$1" forticlient vpn "${@:2}" 2>&1; }
+
+# The CLI allows one instance at a time and exits 0 even on errors, so retry
+# briefly while another command holds the lock, and let callers read the text.
+fc() {
+  local out i
+  for i in {1..15}; do
+    out=$(fc_once 20 "$@")
+    [[ $out == "$LOCKED" ]] || break
+    sleep 0.2
+  done
+  printf '%s\n' "$out"
+}
+
+# One field from `forticlient vpn view` output: "  Label: value".
+view_field() { sed -n "s/^ *$1: //p" <<<"$2" | head -n1; }
+
+cmd_status() {
+  local out line
+  if ! installed; then
+    printf 'installed\t0\n'
+    return 0
+  fi
+  printf 'installed\t1\nservice\t%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null)"
+  service_active || return 0
+  # No retry here: a poll that loses the race just keeps the last state.
+  out=$(fc_once 10 status)
+  if [[ $out == "$LOCKED" ]]; then
+    printf 'busy\t1\n'
+    return 0
+  fi
+  while IFS= read -r line; do
+    case $line in
+      "Status: Not Running" | "Status: Disconnected") printf 'state\tdisconnected\n' ;;
+      "Status: Connected") printf 'state\tconnected\n' ;;
+      "Status: Connecting"*) printf 'state\tconnecting\n' ;;
+      "Status: Re-Connecting") printf 'state\treconnecting\n' ;;
+      "Status: XAuth") printf 'state\tauthenticating\n' ;;
+      "Status: "*) printf 'state\tunknown\n' ;;
+      "  VPN name: "*) printf 'name\t%s\n' "${line#*: }" ;;
+      "  Username: "*) printf 'user\t%s\n' "${line#*: }" ;;
+      "  IP: "*) printf 'ip\t%s\n' "${line#*: }" ;;
+      "  Sent bytes: "*) printf 'sent\t%s\n' "${line#*: }" ;;
+      "  Recv bytes: "*) printf 'recv\t%s\n' "${line#*: }" ;;
+      "  Duration: "*) printf 'duration\t%s\n' "${line#*: }" ;;
+    esac
+  done <<<"$out"
+}
+
+cmd_profiles() {
+  local kind="" line name view gateway host port auth user
+  service_active || return 0
+  while IFS= read -r line; do
+    case $line in
+      "  Personal VPNs:") kind=personal ;;
+      "  Corporate VPNs:") kind=corporate ;;
+      "    "*)
+        [[ -n $kind ]] || continue
+        name=${line#    }
+        view=$(fc view "$name")
+        [[ $view == "VPN: "* ]] || continue
+        gateway=$(view_field "Remote Gateway" "$view")
+        host=$gateway port=443
+        if [[ $gateway =~ ^(.*):([0-9]+)$ ]]; then
+          host=${BASH_REMATCH[1]} port=${BASH_REMATCH[2]}
+        fi
+        user=$(view_field "Username" "$view")
+        case $(view_field "Authentication" "$view") in
+          "Prompt on login") auth=prompt ;;
+          Disabled) auth=none ;;
+          *) auth=save ;;
+        esac
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$kind" "$host" "$port" "$auth" "$user" \
+          "$(view_field "Save Password" "$view")" "$(view_field "Auto Connect" "$view")" \
+          "$(view_field "Always Up" "$view")"
+        ;;
+    esac
+  done < <(fc list)
+}
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+# The edit prompts are fixed once the gateway carries its port: gateway,
+# authentication, the username for "save", then the certificate type, which is
+# left as it is (an empty answer keeps the current value).
+cmd_save() {
+  local name=${1:-} host=${2:-} port=${3:-} auth=${4:-} user=${5:-} answers out
+  [[ -n $name && $name != *[$'\t\n']* ]] || fail "Give the profile a name."
+  # FortiClient would read a leading "-" as an option.
+  [[ $name != -* ]] || fail "A profile name can't start with \"-\"."
+  host=${host#https://}
+  host=${host%/}
+  # A gateway typed as host:port wins over the port field.
+  if [[ $host =~ ^(.*):([0-9]+)$ ]]; then
+    host=${BASH_REMATCH[1]} port=${BASH_REMATCH[2]}
+  fi
+  [[ -n $host && $host != *[[:space:]]* ]] || fail "Enter the remote gateway, without spaces."
+  [[ $port =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || fail "The port must be a number from 1 to 65535."
+  port=$((10#$port))
+  case $auth in
+    prompt) answers="$host:$port"$'\n1\n\n' ;;
+    none) answers="$host:$port"$'\n3\n\n' ;;
+    save)
+      [[ -n $user && $user != *[$'\t\n']* ]] || fail "Enter the username to save."
+      [[ $user != -* ]] || fail "A username can't start with \"-\"."
+      answers="$host:$port"$'\n2\n'"$user"$'\n\n'
+      ;;
+    *) fail "Unknown authentication: $auth" ;;
+  esac
+  out=$(fc edit "$name" <<<"$answers")
+  [[ $out == *"DONE."* ]] || fail "$(grep -m1 -iE 'error|invalid|failed' <<<"$out" || echo "FortiClient didn't save the profile.")"
+}
+
+cmd_remove() {
+  local name=${1:-}
+  [[ -n $name ]] || fail "No profile named."
+  fc remove "$name" >/dev/null
+  # remove prints the same thing whether or not the profile existed, so check.
+  fc list | grep -qxF "    $name" && fail "FortiClient didn't remove $name."
+  return 0
+}
+
+cmd_disconnect() {
+  local out
+  out=$(fc disconnect)
+  [[ -n $out ]] || out="FortiClient didn't answer."
+  [[ $out == *"DONE."* || $out == *"not running"* ]] || fail "$out"
+}
+
+# Runs `forticlient vpn connect` on a pseudo-terminal, since it only reads
+# passwords from a terminal. The password arrives on stdin, is typed into the
+# first password prompt once the terminal has stopped echoing, and is never put
+# in argv, the environment or a file. Any other prompt (FortiToken, certificate
+# warning, disclaimer...) is passed up to the plugin, and its answer comes back
+# as a line on stdin.
+read -r -d '' CONNECT_BRIDGE <<'PY'
+import os, pty, select, signal, sys, termios, time
+
+preset = sys.argv[1] == "1"
+argv = sys.argv[2:]
+IDLE_LIMIT = 120  # seconds with no output and no open prompt
+
+def emit(*fields):
+    sys.stdout.write("\t".join(f.replace("\t", " ").replace("\n", " ") for f in fields) + "\n")
+    sys.stdout.flush()
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["LC_ALL"] = "C"
+    try:
+        os.execvp(argv[0], argv)
+    finally:
+        os._exit(127)
+
+def stop(*_):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    sys.exit(130)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+def echo_on():
+    try:
+        return bool(termios.tcgetattr(fd)[3] & termios.ECHO)
+    except termios.error:
+        return True
+
+stdin_buf = b""
+answers = []
+stdin_open = True
+password = None
+if preset:
+    # The first line is the password; wait for it before starting.
+    while b"\n" not in stdin_buf:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        stdin_buf += chunk
+    line, _, stdin_buf = stdin_buf.partition(b"\n")
+    password = line.decode(errors="replace")
+
+partial = ""
+context = []
+waiting_secret = False
+waiting = False   # a prompt is open and its answer has not come yet
+drop_echo = None  # visible answers come back echoed; drop that copy
+last_data = time.time()
+connected = False  # never time out a session that's up
+
+def handle_line(line):
+    global drop_echo, connected
+    line = line.strip()
+    if not line:
+        return
+    if drop_echo is not None and line == drop_echo:
+        drop_echo = None
+        return
+    drop_echo = None
+    if line.startswith("Status: "):
+        connected = line[8:].lower().startswith("connected")
+        emit("status", line[8:])
+    elif line.startswith("Notification: "):
+        text = line[14:]
+        if text.lower().startswith("error"):
+            emit("error", text.split(":", 1)[-1].strip() or text)
+        else:
+            emit("info", text)
+    elif line.startswith(("Error: ", "ERROR: ")):
+        emit("error", line.split(": ", 1)[1])
+    elif line == "DONE.":
+        emit("done")
+    elif line.startswith(("Connect VPN:", "Password unchanged", "Failed to get credentials from system")):
+        pass  # the keystore line only means no saved password was found
+    elif line == "Another instance of this program is running.":
+        emit("error", "FortiClient is busy with another command. Try again.")
+    elif "already running" in line or line.startswith("Please input password"):
+        emit("error", line)
+    else:
+        context.append(line)
+        del context[:-6]
+
+def answer(text, secret):
+    global drop_echo
+    os.write(fd, text.encode() + b"\r")
+    drop_echo = None if secret else text
+
+while True:
+    fds = [fd] + ([0] if stdin_open else [])
+    ready, _, _ = select.select(fds, [], [], 0.15)
+    if 0 in ready:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            stdin_open = False
+            if waiting:
+                stop()  # the plugin went away mid-prompt: cancel
+        else:
+            stdin_buf += chunk
+            while b"\n" in stdin_buf:
+                line, _, stdin_buf = stdin_buf.partition(b"\n")
+                answers.append(line.decode(errors="replace"))
+    if fd in ready:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            break
+        last_data = time.time()
+        partial += data.decode(errors="replace").replace("\r", "")
+        *lines, partial = partial.split("\n")
+        for line in lines:
+            handle_line(line)
+        continue
+    # Quiet now. Unfinished output ending in ":" is a prompt.
+    prompt = partial.strip()
+    if prompt.endswith(":") and not waiting:
+        # Give the CLI a moment to turn echo off for hidden input.
+        if time.time() - last_data < 0.3:
+            continue
+        secret = not echo_on()
+        partial = ""
+        if secret and password is not None and prompt.endswith("Password:"):
+            answer(password, True)
+            password = None
+        else:
+            emit("prompt", "1" if secret else "0", prompt, " / ".join(context))
+            waiting = True
+            waiting_secret = secret
+        context.clear()
+    if waiting and answers:
+        answer(answers.pop(0), waiting_secret)
+        waiting = False
+    if not waiting and not connected and time.time() - last_data > IDLE_LIMIT:
+        emit("error", "FortiClient stopped responding.")
+        stop()
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 1)
+PY
+
+cmd_connect() {
+  local name=${1:-} preset=0 arg prev="" out
+  [[ -n $name ]] || fail "No profile named."
+  for arg in "${@:2}"; do
+    # FortiClient would read a leading "-" as an option.
+    [[ $prev == -u && $arg == -* ]] && fail "A username can't start with \"-\"."
+    [[ $arg == -p ]] && preset=1
+    prev=$arg
+  done
+  # Wait out a status poll that holds the lock, or connect would lose the race.
+  for _ in {1..15}; do
+    out=$(fc_once 10 status)
+    [[ $out == "$LOCKED" ]] || break
+    sleep 0.2
+  done
+  # A failed attempt can leave the service "connecting" for a moment, which
+  # makes a new connect refuse to start.
+  if [[ $out == "Status: Connecting"* ]]; then
+    fc disconnect >/dev/null
+  fi
+  exec python3 -I -c "$CONNECT_BRIDGE" "$preset" forticlient vpn connect "$@"
+}
+
+# Only starts it: whether it also starts at boot is asked about in setup.
+cmd_start_service() {
+  # systemctl asks polkit, which shows Omarchy's password prompt.
+  systemctl start "$SERVICE" || fail "The FortiClient service wasn't started."
+}
+
+# --- Setup ---
+
+# Yes/no in the terminal; without a terminal it's no.
+ask() {
+  [[ -t 0 && -t 1 ]] || return 1
+  if command -v gum >/dev/null; then
+    gum confirm "$1"
+  else
+    local reply
+    read -rp "$1 [y/N] " reply && [[ $reply == [yY]* ]]
+  fi
+}
+
+# The bar section holding the widget, or nothing when it isn't in the bar.
+bar_section() {
+  jq -r --arg id "$PLUGIN_ID" '
+    .bar.layout // {} | to_entries[] | select(any(.value[]?; .id == $id)) | .key
+  ' "$HOME/.config/omarchy/shell.json" 2>/dev/null | head -n1
+}
+
+setup_placement() {
+  local current section
+  current=$(bar_section)
+  if command -v gum >/dev/null; then
+    section=$(printf '%s\n' left center right |
+      gum choose --header="Put the FortiClient VPN icon in which bar section?" --selected "${current:-right}") || return 0
+  else
+    read -rp "Put the FortiClient VPN icon in which bar section? (left/center/right) [${current:-right}] " section
+    section=${section:-${current:-right}}
+  fi
+  [[ $section =~ ^(left|center|right)$ ]] || return 0
+  if [[ -z $current ]]; then
+    omarchy plugin enable "$PLUGIN_ID" --section "$section"
+  elif [[ $section != "$current" ]]; then
+    omarchy bar move "$PLUGIN_ID" --section "$section" && echo "Moved to the $section section."
+  else
+    echo "The icon stays in the $section section."
+  fi
+}
+
+setup_tray() {
+  local choice off="Turn it off (this widget replaces it)" gtk="Install gtk2 from the AUR (builds from source)"
+  tray_broken || return 0
+  echo "FortiClient's own tray icon needs gtk2, which isn't installed, so it keeps restarting."
+  if command -v gum >/dev/null; then
+    choice=$(printf '%s\n' "$off" "$gtk" "Leave it" | gum choose --header="FortiClient's tray icon:") || return 0
+  else
+    read -rp "Turn FortiClient's tray icon off (o), install gtk2 from the AUR (g), or leave it (l)? [o] " choice
+    case ${choice:-o} in o*) choice=$off ;; g*) choice=$gtk ;; *) choice="" ;; esac
+  fi
+  case $choice in
+    "$off")
+      # A same-named entry in the user's autostart folder hides the system one
+      # from the next login on; stopping the unit ends this session's loop.
+      mkdir -p "${TRAY_OVERRIDE%/*}" &&
+        printf '[Desktop Entry]\nType=Application\nName=Fortitray\nHidden=true\n' >"$TRAY_OVERRIDE" &&
+        echo "FortiClient's tray icon is off. To bring it back, delete $TRAY_OVERRIDE."
+      systemctl --user stop "$TRAY_UNIT" 2>/dev/null
+      ;;
+    "$gtk")
+      omarchy pkg aur add gtk2 || echo "Installing gtk2 didn't work." >&2
+      ;;
+  esac
+}
+
+cmd_setup() {
+  if ! [[ -t 0 && -t 1 ]]; then
+    echo "Run this in a terminal." >&2
+    return 1
+  fi
+  mkdir -p "${OFFERED_FILE%/*}" && touch "$OFFERED_FILE"
+
+  if installed; then
+    echo "FortiClient VPN is installed."
+  elif ask "FortiClient VPN isn't installed. Install forticlient-vpn from the AUR now? (asks for your password)"; then
+    omarchy pkg aur add forticlient-vpn || echo "Installing forticlient-vpn didn't work." >&2
+  fi
+
+  if installed; then
+    if service_ready; then
+      echo "The FortiClient service is running and starts at boot."
+    elif ask "Start the FortiClient service now and at every boot? It does the VPN work, so it runs as root; this asks for your password once."; then
+      systemctl enable --now "$SERVICE" && echo "The FortiClient service is running."
+    fi
+  fi
+
+  setup_tray
+  setup_placement
+  return 0
+}
+
+# Once, the first time the plugin loads: offer setup in a notification, unless
+# there's nothing to set up. Nothing changes unless the user clicks it, and that
+# opens a terminal where each step is asked about again.
+cmd_offer_setup() {
+  local self choice
+  installed && service_ready && ! tray_broken && return 0
+  self=$(realpath "${BASH_SOURCE[0]}") || return 0
+  # Created exclusively (noclobber), so when several reloads start this at
+  # once only one of them gets past here.
+  mkdir -p "${OFFERED_FILE%/*}" 2>/dev/null || return 0
+  (set -C; : >"$OFFERED_FILE") 2>/dev/null || return 0
+  # The plugin loads with the shell, which is also the notification server,
+  # so give that a moment to come up. If it never does, or sending fails,
+  # hand the marker back so the offer is made on a later load instead.
+  for _ in {1..60}; do
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications 2>/dev/null | grep -q true && break
+    sleep 0.5
+  done
+  # Clicking the notification is the "default" action; dismissing it is "no".
+  if ! choice=$(notify -A default="Set up" "FortiClient VPN" \
+    "Click to finish setup: the FortiClient service, its tray icon, and where this icon sits. Or later, run: ${self/#$HOME/\~} setup"); then
+    rm -f "$OFFERED_FILE"
+    return 0
+  fi
+  [[ $choice == default ]] || return 0
+  omarchy-launch-floating-terminal-with-presentation "$(printf '%q' "$self") setup"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  profiles) cmd_profiles ;;
+  save) cmd_save "${@:2}" ;;
+  remove) cmd_remove "${2:-}" ;;
+  connect) cmd_connect "${@:2}" ;;
+  disconnect) cmd_disconnect ;;
+  start-service) cmd_start_service ;;
+  setup) cmd_setup ;;
+  offer-setup) cmd_offer_setup ;;
+  *)
+    echo "usage: forticlient-vpn status | profiles | save <name> <host> <port> <prompt|save|none> [user] | remove <name>" >&2
+    echo "       forticlient-vpn connect <name> [-u user] [-p] [-s] [-a] [-w] | disconnect | start-service | setup" >&2
+    exit 1
+    ;;
+esac

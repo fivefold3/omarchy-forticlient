@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.fivefold3.forticlient",
+  "name": "FortiClient VPN",
+  "version": "1.0.0",
+  "author": "fivefold3",
+  "license": "MIT",
+  "description": "FortiClient VPN (free edition) in the bar: connect, disconnect and manage profiles through FortiClient's own CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "FortiClient VPN",
+    "description": "Connect and disconnect FortiClient VPN profiles, create and edit them, and save your username or password.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status check interval (seconds)",
+        "description": "How often the icon checks the VPN while the panel is closed.",
+        "min": 3,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}
